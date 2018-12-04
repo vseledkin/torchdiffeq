@@ -8,13 +8,14 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--tol', type=float, default=1e-3)
 parser.add_argument('--adjoint', type=eval, default=False)
 parser.add_argument('--niters', type=int, default=500)
-parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--lr', type=float, default=0.003)
 parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
 
@@ -27,14 +28,26 @@ else:
 def generate_spiral2d(nspiral=1000,
                       ntotal=500,
                       nsample=100,
-                      t0=200,
-                      noise_std=.2,
-                      to_tensor=False):
+                      start=0.,
+                      stop=1,  # approximately equal to 6pi
+                      noise_std=.1,
+                      to_tensor=False,
+                      a=0.,
+                      b=1.,
+                      device='cpu'):
   """Parametric formula for 2d spiral is `r = a + b * theta`.
 
   Args:
     nspiral: number of spirals, i.e. batch dimension number
-    other args same as above
+    ntotal: total number of datapoints per spiral
+    nsample: number of sampled datapoints for model fitting per spiral
+    start: spiral starting theta value
+    stop: spiral ending theta value
+    noise_std: observation noise standard deviation
+    to_tensor: convert to `torch.Tensor`
+    a, b: parameters of the Archimedean spiral
+    device: cpu/gpu device to copy tensor to
+
   Returns: 
     Tuple where first element is true trajectory of size (nspiral, ntotal, 2),
     second element is noisy observations of size (nspiral, nsample, 2),
@@ -42,22 +55,34 @@ def generate_spiral2d(nspiral=1000,
     and fourth element is timestamps of size (nspiral, nsample)
   """
   # sample a and b from Gaussian
-  a, b = npr.randn(nspiral, 1), npr.randn(nspiral, 1) + 1.
-  thetas = np.linspace(start=0, stop=6 * np.pi, num=ntotal)  # (ntotal,)
-  rs = a + b * thetas[None, :]  # (nspiral, ntotal)
-  xs, ys = rs * np.cos(thetas), rs * np.sin(thetas)
-  # create batch
-  orig_traj = np.stack((xs, ys), axis=2)  # (nspiral, ntotal, 2)
-  orig_ts = thetas
-  samp_traj = orig_traj[:, t0:t0 + nsample, :].copy()
-  samp_traj += npr.randn(*samp_traj.shape) * noise_std
-  samp_ts = thetas[t0:t0 + nsample]
+  thetas = np.linspace(start, stop, num=ntotal)  # (ntotal,)
+  rs = a + b * thetas  # (ntotal,)
+  xs, ys = rs * np.cos(thetas), rs * np.sin(thetas)  # (ntotal,)
+  orig_traj = np.stack((xs, ys), axis=1)  # (ntotal, 2)
+  orig_ts = thetas  # (ntotal,)
+
+  # sample starting timestamps
+  samp_traj = []
+  samp_ts = []
+  for _ in range(nspiral):
+    t0 = np.argmax(
+        npr.multinomial(1, [1. / (ntotal - nsample)] * (ntotal - nsample)))
+    traj = orig_traj[t0:t0 + nsample, :].copy()
+    traj += npr.randn(*traj.shape) * noise_std
+    samp_traj.append(traj)
+    samp_ts.append(orig_ts[t0:t0 + nsample])
+
+  samp_traj = np.stack(samp_traj, axis=0)
+  samp_ts = np.stack(samp_ts, axis=0)
+
+  assert samp_traj.shape == (nspiral, nsample, 2)
+  assert samp_ts.shape == (nspiral, nsample)
 
   if to_tensor:
-    orig_traj = torch.from_numpy(orig_traj).float()
-    samp_traj = torch.from_numpy(samp_traj).float()
-    orig_ts = torch.from_numpy(orig_ts).float()
-    samp_ts = torch.from_numpy(samp_ts).float()
+    orig_traj = torch.from_numpy(orig_traj).float().to(device)
+    samp_traj = torch.from_numpy(samp_traj).float().to(device)
+    orig_ts = torch.from_numpy(orig_ts).float().to(device)
+    samp_ts = torch.from_numpy(samp_ts).float().to(device)
 
   return orig_traj, samp_traj, orig_ts, samp_ts
 
@@ -82,6 +107,26 @@ class LatentODEfunc(nn.Module):
     return out
 
 
+class RecognitionRNN(nn.Module):
+
+  def __init__(self, latent_dim=4, obs_dim=2, nhidden=25, nbatch=1):
+    super(RecognitionRNN, self).__init__()
+
+    self.nhidden = nhidden
+    self.nbatch = nbatch
+    self.i2h = nn.Linear(obs_dim + nhidden, nhidden)
+    self.h2o = nn.Linear(nhidden, latent_dim * 2)
+
+  def forward(self, x, h):
+    combined = torch.cat((x, h), dim=1)
+    h = torch.tanh(self.i2h(combined))
+    out = self.h2o(h)
+    return out, h
+
+  def initHidden(self):
+    return torch.zeros(self.nbatch, self.nhidden)
+
+
 class Decoder(nn.Module):
 
   def __init__(self, latent_dim=4, obs_dim=2, nhidden=20):
@@ -95,25 +140,6 @@ class Decoder(nn.Module):
     out = self.relu(out)
     out = self.fc2(out)
     return out
-
-
-class RecognitionRNN(nn.Module):
-
-  def __init__(self, latent_dim=4, obs_dim=2, nhidden=25):
-    super(RecognitionRNN, self).__init__()
-
-    self.nhidden = nhidden
-    self.i2h = nn.Linear(obs_dim + nhidden, nhidden)
-    self.h2o = nn.Linear(nhidden, latent_dim * 2)
-
-  def forward(self, x, h):
-    combined = torch.cat((x, h), dim=1)
-    h = torch.tanh(self.i2h(combined))
-    out = self.h2o(h)  # mean and logvar for approx. posterior
-    return out, h
-
-  def initHidden(self):
-    return torch.zeros(1, self.nhidden)
 
 
 class RunningAverageMeter(object):
@@ -136,9 +162,19 @@ class RunningAverageMeter(object):
 
 
 def log_normal_pdf(x, mean, logvar):
-  const = torch.log(torch.from_numpy(np.array([2. * np.pi])).float())
+  const = torch.from_numpy(np.array([2. * np.pi])).float().to(x.device)
+  const = torch.log(const)
   return -.5 * (const + logvar + (x - mean) ** 2. / torch.exp(logvar))
 
+
+def normal_kl(mu1, lv1, mu2, lv2):
+  v1 = torch.exp(lv1)
+  v2 = torch.exp(lv2)
+  lstd1 = lv1 / 2.
+  lstd2 = lv2 / 2.
+
+  kl = lstd2 - lstd1 + ((v1 + (mu1 - mu2) ** 2.) / (2. * v2)) - .5
+  return kl
 
 if __name__ == '__main__':
   # constants
@@ -146,85 +182,90 @@ if __name__ == '__main__':
   nhidden = 25
   rnn_nhidden = 25
   obs_dim = 2
-  noise_std = .2
-  nspiral = 1  # TODO: fit more than one dynamics
+  noise_std = .3
+  nspiral = 5
+  start = 0.
+  stop = 4 * np.pi
+  ntotal = 500
+  nsample = 100
+
+  device = torch.device('cuda:' + str(args.gpu)
+                        if torch.cuda.is_available() else 'cpu')
 
   # generate toy data
   orig_traj, samp_traj, orig_ts, samp_ts = generate_spiral2d(
-      nspiral=nspiral, noise_std=noise_std, to_tensor=True)
-
-  if torch.cuda.is_available():
-    device = torch.device('cuda:' + str(args.gpu))
-  else:
-    device = torch.device('cpu')
+      nspiral=nspiral,
+      start=start,
+      stop=stop,
+      noise_std=noise_std,
+      to_tensor=True,
+      device=device
+  )
 
   # model
-  # TODO: compose into single `nn.Module`
-  func = LatentODEfunc(latent_dim=latent_dim, nhidden=nhidden).to(device)
-  dec = Decoder(
-      latent_dim=latent_dim, obs_dim=obs_dim, nhidden=nhidden).to(device)
-  rec = RecognitionRNN(
-      latent_dim=latent_dim, obs_dim=obs_dim, nhidden=rnn_nhidden).to(device)
+  func = LatentODEfunc(latent_dim, nhidden).to(device)
+  rec = RecognitionRNN(latent_dim, obs_dim, rnn_nhidden, nspiral).to(device)
+  dec = Decoder(latent_dim, obs_dim, nhidden).to(device)
   params = (list(func.parameters()) +
             list(dec.parameters()) + list(rec.parameters()))
-  optimizer = optim.RMSprop(params, lr=args.lr)
+  optimizer = optim.Adam(params, lr=args.lr)
+  loss_meter = RunningAverageMeter()
+
   for itr in range(1, args.niters + 1):
     optimizer.zero_grad()
     # backward in time to infer q(z_0)
-    h = rec.initHidden()
+    h = rec.initHidden().to(device)
     for t in reversed(range(samp_traj.size(1))):
-      obs = samp_traj[:, t, :].to(device)
+      obs = samp_traj[:, t, :]
       out, h = rec.forward(obs, h)
     qz0_mean, qz0_logvar = out[:, :latent_dim], out[:, latent_dim:]
-    z0 = torch.randn(qz0_mean.size()) * torch.exp(.5 * qz0_logvar) + qz0_mean
+    epsilon = torch.randn(qz0_mean.size()).to(device)
+    z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
 
     # forward in time and solve ode for reconstructions
-    pred_x = []
-    pred_z = odeint(func, z0, samp_ts).permute(1, 0, 2)
-    for t in range(pred_z.size(1)):
-      zt = pred_z[:, t, :]
-      xt = dec(zt)
-      pred_x.append(xt)
-    pred_x = torch.stack(pred_x, dim=1)
-
-    # debug
-    if itr > 300:
-      orig_traj_ = orig_traj.numpy()
-      samp_traj_ = samp_traj.numpy()
-      xs = pred_x.detach().numpy()
-      plt.figure()
-      plt.plot(xs[0, :, 0], xs[0, :, 1], 'r', label='learned traj')
-      plt.plot(
-          orig_traj_[0, :, 0], orig_traj_[0, :, 1], 'g', label='true traj')
-      plt.scatter(
-          samp_traj_[0, :, 0], samp_traj_[0, :, 1], s=3, label='sampled data')
-      plt.legend()
-      plt.show()
+    # `odeint` cannot batch with different time seqs, hence for-loop needed
+    pred_z = []
+    for _z0, _ts in zip(z0, samp_ts):
+      _zs = odeint(func, _z0, _ts)  # (1, nsample, latent_dim)
+      pred_z.append(_zs)
+    pred_z = torch.stack(pred_z, dim=0)
+    pred_x = dec(pred_z)
 
     # compute loss
-    noise_std_ = torch.zeros(pred_x.size()) + noise_std  # to Tensor
-    noise_logvar = 2. * torch.log(noise_std_)
+    noise_std_ = torch.zeros(pred_x.size()).to(device)
+    noise_std_ += noise_std
+    noise_logvar = 2. * torch.log(noise_std_).to(device)
     logpx = log_normal_pdf(samp_traj, pred_x, noise_logvar).sum(-1).sum(-1)
-    pz0_mean = pz0_logvar = torch.zeros(z0.size())
-    logpz0 = log_normal_pdf(z0, pz0_mean, pz0_logvar)
-    logqz0 = log_normal_pdf(z0, qz0_mean, qz0_logvar)
-    mc_kl = torch.sum(logqz0 - logpz0, dim=1)
-    loss = torch.mean(-logpx + mc_kl, dim=0)
-    print('Iter: {}, elbo: {:.4f}'.format(itr, -loss.cpu().detach().numpy()))
+    pz0_mean = pz0_logvar = torch.zeros(z0.size()).to(device)
+    analytic_kl = normal_kl(qz0_mean, qz0_logvar, pz0_mean, pz0_logvar).sum(-1)
+    loss = torch.mean(-logpx + analytic_kl, dim=0)
     loss.backward()
     optimizer.step()
+    loss_meter.update(loss.item())
+    print('Iter: {}, running avg elbo: {:.4f}'.format(itr, -loss_meter.avg))
   print("Training complete.")
 
-  # sample latent traj from prior
+  # sample latent traj from approx. posterior; sampling from the prior gives
+  # bad performance
   with torch.no_grad():
-    xs = []
-    z0 = torch.randn(1, latent_dim)
-    zs = odeint(func, z0, samp_ts).permute(1, 0, 2)
-    for t in range(zs.size(1)):
-      zt = zs[:, t, :].to(device)
-      xt = dec(zt)
-      xs.append(xt)
-    xs = torch.stack(xs, dim=1)
+    h = rec.initHidden().to(device)
+    for t in reversed(range(samp_traj.size(1))):
+      obs = samp_traj[:, t, :]
+      out, h = rec.forward(obs, h)
+    qz0_mean, qz0_logvar = out[:, :latent_dim], out[:, latent_dim:]
+    epsilon = torch.randn(qz0_mean.size()).to(device)
+    z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
+
+    t0_ = samp_ts[0, 0]
+    t_pos = np.linspace(t0_, stop, num=3000)
+    t_neg = np.linspace(start, t0_, num=3000)[::-1].copy()
+
+    t_pos = torch.from_numpy(t_pos).float().to(device)
+    t_neg = torch.from_numpy(t_neg).float().to(device)
+    z_pos = odeint(func, z0, t_pos).permute(1, 0, 2)
+    z_neg = odeint(func, z0, t_neg).permute(1, 0, 2)
+    x_pos, x_neg = dec(z_pos), dec(z_neg)
+    xs = torch.cat((torch.flip(x_neg, dims=[1]), x_pos), dim=1)
 
   xs = xs.cpu().numpy()
   orig_traj = orig_traj.cpu().numpy()
@@ -232,7 +273,7 @@ if __name__ == '__main__':
 
   # visualize
   plt.figure()
-  plt.plot(orig_traj[0, :, 0], orig_traj[0, :, 1], 'g', label='true traj')
+  plt.plot(orig_traj[:, 0], orig_traj[:, 1], 'g', label='true traj')
   plt.plot(xs[0, :, 0], xs[0, :, 1], 'r', label='learned traj')
   plt.scatter(
       samp_traj[0, :, 0], samp_traj[0, :, 1], s=3, label='sampled data')
