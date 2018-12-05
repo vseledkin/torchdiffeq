@@ -15,7 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--tol', type=float, default=1e-3)
 parser.add_argument('--adjoint', type=eval, default=False)
 parser.add_argument('--niters', type=int, default=500)
-parser.add_argument('--lr', type=float, default=0.003)
+parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
 
@@ -49,42 +49,38 @@ def generate_spiral2d(nspiral=1000,
     device: cpu/gpu device to copy tensor to
 
   Returns: 
-    Tuple where first element is true trajectory of size (nspiral, ntotal, 2),
-    second element is noisy observations of size (nspiral, nsample, 2),
-    third element is timestamps of size (nspiral, ntotal),
-    and fourth element is timestamps of size (nspiral, nsample)
+    Tuple where first element is a tensor of size (nspiral, ntotal, 2)
+    for true trajectories, second element is a tensor of size
+    (nspiral, nsample, 2) for noisy observation, third element is
+    a tensor of size (nspiral, ntotal) for all timestamps,
+    and fourth element is a list of length `nspiral` for indices of initial
+    timestamps
   """
   # sample a and b from Gaussian
-  thetas = np.linspace(start, stop, num=ntotal)  # (ntotal,)
-  rs = a + b * thetas  # (ntotal,)
-  xs, ys = rs * np.cos(thetas), rs * np.sin(thetas)  # (ntotal,)
+  ts = np.linspace(start, stop, num=ntotal)  # (ntotal,)
+  rs = a + b * ts  # (ntotal,)
+  xs, ys = rs * np.cos(ts), rs * np.sin(ts)  # (ntotal,)
   orig_traj = np.stack((xs, ys), axis=1)  # (ntotal, 2)
-  orig_ts = thetas  # (ntotal,)
 
   # sample starting timestamps
+  samp_t0_ids = []
   samp_traj = []
-  samp_ts = []
   for _ in range(nspiral):
-    t0 = np.argmax(
-        npr.multinomial(1, [1. / (ntotal - nsample)] * (ntotal - nsample)))
-    traj = orig_traj[t0:t0 + nsample, :].copy()
+    t0_id = np.argmax(
+        npr.multinomial(
+            1, [1. / (ntotal - nsample - 1)] * (ntotal - nsample - 1)))
+    samp_t0_ids.append(t0_id)
+    traj = orig_traj[t0_id:t0_id + nsample, :].copy()
     traj += npr.randn(*traj.shape) * noise_std
     samp_traj.append(traj)
-    samp_ts.append(orig_ts[t0:t0 + nsample])
-
   samp_traj = np.stack(samp_traj, axis=0)
-  samp_ts = np.stack(samp_ts, axis=0)
-
-  assert samp_traj.shape == (nspiral, nsample, 2)
-  assert samp_ts.shape == (nspiral, nsample)
 
   if to_tensor:
     orig_traj = torch.from_numpy(orig_traj).float().to(device)
     samp_traj = torch.from_numpy(samp_traj).float().to(device)
-    orig_ts = torch.from_numpy(orig_ts).float().to(device)
-    samp_ts = torch.from_numpy(samp_ts).float().to(device)
+    ts = torch.from_numpy(ts).float().to(device)
 
-  return orig_traj, samp_traj, orig_ts, samp_ts
+  return orig_traj, samp_traj, ts, samp_t0_ids
 
 
 class LatentODEfunc(nn.Module):
@@ -179,11 +175,11 @@ def normal_kl(mu1, lv1, mu2, lv2):
 if __name__ == '__main__':
   # constants
   latent_dim = 4
-  nhidden = 25
+  nhidden = 20
   rnn_nhidden = 25
   obs_dim = 2
-  noise_std = .3
-  nspiral = 5
+  noise_std = .1
+  nspiral = 1000
   start = 0.
   stop = 4 * np.pi
   ntotal = 500
@@ -193,7 +189,7 @@ if __name__ == '__main__':
                         if torch.cuda.is_available() else 'cpu')
 
   # generate toy data
-  orig_traj, samp_traj, orig_ts, samp_ts = generate_spiral2d(
+  orig_traj, samp_traj, ts, samp_t0_ids = generate_spiral2d(
       nspiral=nspiral,
       start=start,
       stop=stop,
@@ -215,19 +211,25 @@ if __name__ == '__main__':
     optimizer.zero_grad()
     # backward in time to infer q(z_0)
     h = rec.initHidden().to(device)
-    for t in reversed(range(samp_traj.size(1))):
-      obs = samp_traj[:, t, :]
+    for i in reversed(range(samp_traj.size(1))):
+      obs = samp_traj[:, i, :]
       out, h = rec.forward(obs, h)
     qz0_mean, qz0_logvar = out[:, :latent_dim], out[:, latent_dim:]
     epsilon = torch.randn(qz0_mean.size()).to(device)
     z0 = epsilon * torch.exp(.5 * qz0_logvar) + qz0_mean
 
     # forward in time and solve ode for reconstructions
-    # `odeint` cannot batch with different time seqs, hence for-loop needed
+    _min_t0_id, _max_t0_id = min(samp_t0_ids), max(samp_t0_ids)
+    _z0 = z0[np.argmin(samp_t0_ids)]
+    _ts = ts[_min_t0_id:_max_t0_id + nsample]
+    _zs = odeint(func, _z0, _ts)
+
     pred_z = []
-    for _z0, _ts in zip(z0, samp_ts):
-      _zs = odeint(func, _z0, _ts)  # (1, nsample, latent_dim)
-      pred_z.append(_zs)
+    for i in range(nspiral):
+      t0_id = samp_t0_ids[i]
+      t0_id_adjust = t0_id - _min_t0_id
+      curr_zs = _zs[t0_id_adjust:t0_id_adjust + nsample]
+      pred_z.append(curr_zs)
     pred_z = torch.stack(pred_z, dim=0)
     pred_x = dec(pred_z)
 
