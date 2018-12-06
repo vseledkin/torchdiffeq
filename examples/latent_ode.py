@@ -17,7 +17,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--adjoint', type=eval, default=False)
 parser.add_argument('--visualize', type=eval, default=False)
 parser.add_argument('--niters', type=int, default=500)
-parser.add_argument('--lr', type=float, default=0.003)
+parser.add_argument('--lr', type=float, default=0.01)
 parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
 
